@@ -7,6 +7,7 @@ struct FileInfo {
     name: String,
     data: String,
     includes: Vec<String>,
+    lines: usize,
 }
 
 fn load_files(path: &str) -> Vec<FileInfo> {
@@ -31,6 +32,7 @@ fn load_files(path: &str) -> Vec<FileInfo> {
         ret.push(FileInfo {
             name,
             data,
+            lines: 0,
             includes: vec![],
         });
     }
@@ -42,6 +44,7 @@ enum SortMode {
     Name,
     Size,
     NumIncludes,
+    Lines,
 }
 
 fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
@@ -52,11 +55,13 @@ fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
         SortMode::Name => return,
         SortMode::Size => data.sort_by(|a, b| a.data.len().cmp(&b.data.len()).reverse()),
         SortMode::NumIncludes => data.sort_by(|a, b| a.includes.len().cmp(&b.includes.len())),
+        SortMode::Lines => data.sort_by(|a, b| a.lines.cmp(&b.lines).reverse()),
     }
 }
 
-fn parse_all_includes(data: &mut [FileInfo]) {
+fn process_data(data: &mut [FileInfo]) {
     for d in data {
+        d.lines = count_file_lines(&d.data);
         d.includes = parse_file_includes(&d.data);
     }
 }
@@ -74,12 +79,13 @@ fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
 }
 
 fn debug_print(data: &[FileInfo]) {
-    println!("File / Size / # Includes");
+    println!("File / Size / Lines / # Includes");
     for it in data {
         println!(
-            "{: <32}  {: >7} {: >3}",
+            "{: <32}  {: >7} {: >7} {: >3}",
             it.name,
             fmt_bignum(it.data.len()),
+            it.lines,
             it.includes.len()
         );
     }
@@ -88,7 +94,12 @@ fn debug_print(data: &[FileInfo]) {
     println!("Total size: {}", fmt_bignum(sum));
 }
 
+fn count_file_lines(data: &str) -> usize {
+    data.lines().count()
+}
+
 fn parse_file_includes(data: &str) -> Vec<String> {
+
     vec!["haha.h".to_string(), "hoho.h".to_string()]
 }
 
@@ -102,12 +113,12 @@ fn main() {
         "name" => SortMode::Name,
         "incl" => SortMode::NumIncludes,
         "size" => SortMode::Size,
+        "line" => SortMode::Lines,
         x => { println!("Unknown sort method {}", x); return; }
     };
 
     let mut data = load_files(&args().nth(1).unwrap());
-
+    process_data(&mut data);
     custom_sort(&mut data, sort_mode);
-    parse_all_includes(&mut data);
     debug_print(&data);
 }
