@@ -2,7 +2,7 @@
 
 use num_format::{Buffer, CustomFormat, Grouping, ToFormattedStr};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env::args;
 use std::fs::File;
 use std::io::Read;
@@ -16,7 +16,10 @@ struct IncludeInfo {
 struct FileInfo {
     name: String,
     data: String,
+    system: bool,
+
     includes: Vec<IncludeInfo>,
+    included_by: Vec<IncludeInfo>,
 
     lines: usize,  // source file lines
     clines: usize, // code lines
@@ -68,9 +71,11 @@ fn load_files(path: &str) -> Vec<FileInfo> {
         ret.push(FileInfo {
             name,
             data,
+            system: false,
             lines: 0,
             clines: 0,
             includes: vec![],
+            included_by: vec![],
             combined_clines: None,
         });
     }
@@ -92,7 +97,7 @@ fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
     data.sort_by(|a, b| a.name.cmp(&b.name));
     // Then sort by whatever else
     match mode {
-        SortMode::Name => return,
+        SortMode::Name => {}
         SortMode::Size => data.sort_by(|a, b| a.data.len().cmp(&b.data.len()).reverse()),
         SortMode::NumIncludes => data.sort_by(|a, b| a.includes.len().cmp(&b.includes.len())),
         SortMode::Lines => data.sort_by(|a, b| a.lines.cmp(&b.lines).reverse()),
@@ -104,9 +109,16 @@ fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
             (Some(al), Some(bl)) => al.cmp(&bl).reverse(),
         }),
     }
+    // Then sort system stuff to the bottom
+    data.sort_by(|a, b| match (a.system, b.system) {
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        _ => Ordering::Equal,
+    });
 }
 
-fn process_data(data: &mut [FileInfo]) {
+/// Returns whether it's possible to build a tree without circular dependencies
+fn process_data_basic(data: &mut Vec<FileInfo>) -> bool {
     // Step 1. Parse files
     for d in data.iter_mut() {
         d.lines = count_file_lines(&d.data);
@@ -127,7 +139,29 @@ fn process_data(data: &mut [FileInfo]) {
         })
     }
 
-    // Step 2. Index includes for quick access
+    // Step 2. Add stabs for system includes
+    let mut to_add = HashSet::<String>::new();
+    for d in data.iter() {
+        for inc in &d.includes {
+            if !inc.system {
+                // should already be on the list
+                continue;
+            }
+            to_add.insert(inc.name.clone());
+        }
+    }
+    data.extend(to_add.into_iter().map(|name| FileInfo {
+        name,
+        data: "".to_string(),
+        system: true,
+        includes: vec![],
+        included_by: vec![],
+        lines: 1,
+        clines: 1,
+        combined_clines: Some(1),
+    }));
+
+    // Step 3. Index includes for quick access
     let hashed: HashMap<String, usize> = data
         .iter()
         .enumerate()
@@ -141,7 +175,7 @@ fn process_data(data: &mut [FileInfo]) {
         }
     }
 
-    // Step 3. Calculate combined cost
+    // Step 4. Calculate combined cost
     loop {
         let mut did_something = false;
         for idx in 0..data.len() {
@@ -159,6 +193,12 @@ fn process_data(data: &mut [FileInfo]) {
             break;
         }
     }
+
+    data.iter().all(|x| x.combined_clines.is_some())
+}
+
+fn process_data_tree(data: &mut [FileInfo]) {
+    //for idx in data.enumerate()
 }
 
 fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
@@ -178,8 +218,12 @@ fn debug_print(data: &[FileInfo]) {
     println!("File / Size / Text lines / LoC / # Includes / Combined LoC");
     for it in data {
         print!(
-            "{: <32}  {: >7}  {: >6}  {: >6}  {: >3}  {: >9}",
-            it.name,
+            "{: <34}{: >7}  {: >6}  {: >6}  {: >3}  {: >9}",
+            if it.system {
+                format!("<{}>", it.name)
+            } else {
+                it.name.clone()
+            },
             fmt_bignum(it.data.len()),
             fmt_bignum(it.lines),
             fmt_bignum(it.clines),
@@ -203,7 +247,11 @@ fn debug_print(data: &[FileInfo]) {
         }
         println!();
     }
-    println!("Total files: {}", data.len());
+    println!(
+        "Total files: {} (+{})",
+        data.iter().filter(|x| !x.system).count(),
+        data.iter().filter(|x| x.system).count()
+    );
     let sum: usize = data.iter().map(|x| x.data.len()).sum();
     println!("Total size: {}", fmt_bignum(sum));
     let sum: usize = data.iter().map(|x| x.combined_clines.unwrap_or(0)).sum();
@@ -351,7 +399,10 @@ fn main() {
     };
 
     let mut data = load_files(&args().nth(1).unwrap());
-    process_data(&mut data);
+    let can_build_tree = process_data_basic(&mut data);
+    if can_build_tree {
+        process_data_tree(&mut data);
+    }
     custom_sort(&mut data, sort_mode);
     debug_print(&data);
     println!("Done.");
