@@ -1,4 +1,6 @@
-use num_format::{Buffer, CustomFormat, Error, Grouping, ToFormattedStr};
+#![allow(dead_code)]
+
+use num_format::{Buffer, CustomFormat, Grouping, ToFormattedStr};
 use std::env::args;
 use std::fs::File;
 use std::io::Read;
@@ -141,6 +143,47 @@ fn skip_to_end_of_line(s: &str) -> &str {
     }
 }
 
+fn extract_include_name<'a>(s: &'a str, closing: &str) -> Option<&'a str> {
+    if let Some(idx) = s.find(closing) {
+        Some(&s[..idx])
+    } else {
+        None
+    }
+}
+
+fn try_extract_include(s: &str) -> Option<&str> {
+    let mut s = s;
+
+    if !s.starts_with("#") {
+        return None;
+    }
+    s = &s[1..];
+
+    while let Some(ss) = skip_whitespace(s) {
+        s = ss;
+    }
+
+    if !s.starts_with("include") {
+        return None;
+    }
+    s = &s[7..];
+
+    while let Some(ss) = skip_whitespace(s) {
+        s = ss;
+    }
+
+    if s.starts_with("<") {
+        // system include
+        extract_include_name(&s[1..], ">")
+    } else if s.starts_with("\"") {
+        // local include
+        extract_include_name(&s[1..], "\"")
+    } else {
+        // should never happen
+        panic!("Shit happened")
+    }
+}
+
 fn parse_file_data(data: &str) -> (Vec<String>, usize) {
     let mut ret = Vec::<String>::new();
     let mut clines = 0usize;
@@ -161,8 +204,11 @@ fn parse_file_data(data: &str) -> (Vec<String>, usize) {
             continue;
         }
 
-        let c = s.chars().nth(0).unwrap();
         clines += 1;
+
+        if let Some(inc) = try_extract_include(s) {
+            ret.push(inc.to_string());
+        }
         s = skip_to_end_of_line(s);
     }
 
@@ -191,4 +237,5 @@ fn main() {
     process_data(&mut data);
     custom_sort(&mut data, sort_mode);
     debug_print(&data);
+    println!("Done.");
 }
