@@ -238,7 +238,7 @@ fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
 
 fn debug_print(data: &[FileInfo]) {
     println!(
-          "File                                 Size  L.Text  L.Code   In  Out    Contrib   Combined  Some of included files"
+          "File                                 Size  L.Text  L.Code   In  Out     Contrib    Combined  Heaviest headers that include this one"
     );
     for it in data {
         let name = if it.stab {
@@ -257,7 +257,7 @@ fn debug_print(data: &[FileInfo]) {
             "?".to_string()
         };
         print!(
-            "{: <34}{: >7}  {: >6}  {: >6}  {: >3}  {: >3} {: >10} {: >10}",
+            "{: <34}{: >7}  {: >6}  {: >6}  {: >3}  {: >3} {: >11} {: >11}",
             name,
             fmt_bignum(it.data.len()),
             fmt_bignum(it.lines),
@@ -268,15 +268,18 @@ fn debug_print(data: &[FileInfo]) {
             combined_loc
         );
 
-        for inc in it.includes.iter().filter(|x| !x.system).take(6) {
-            print!("  {}", inc);
-        }
-        let num_sys = it.includes.iter().filter(|x| x.system).count();
-        if it.includes.len() - num_sys > 6 {
-            print!("  ...");
-        }
-        if num_sys > 0 {
-            print!("  +{}", num_sys);
+        let mut incl_by = it.included_by.clone();
+        incl_by.sort_by(|a, b| {
+            let a = data[*a].contributes_total.unwrap_or(0);
+            let b = data[*b].contributes_total.unwrap_or(0);
+            a.cmp(&b).reverse()
+        });
+        for inc in incl_by {
+            if data[inc].stab {
+                print!("  <{}>", data[inc].name);
+            } else {
+                print!("  {}", data[inc].name);
+            }
         }
         println!();
     }
