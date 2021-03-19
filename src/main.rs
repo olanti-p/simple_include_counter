@@ -16,15 +16,16 @@ struct IncludeInfo {
 struct FileInfo {
     name: String,
     data: String,
-    system: bool,
+    stab: bool, // stab for a missing file
 
     includes: Vec<IncludeInfo>,
-    included_by: Vec<IncludeInfo>,
+    included_by: Vec<usize>,
 
     lines: usize,  // source file lines
     clines: usize, // code lines
 
-    combined_clines: Option<usize>, // code lines with includes
+    combined_clines: Option<usize>,   // code lines with includes
+    contributes_total: Option<usize>, // contributes lines in total
 }
 
 impl std::fmt::Display for IncludeInfo {
@@ -71,12 +72,13 @@ fn load_files(path: &str) -> Vec<FileInfo> {
         ret.push(FileInfo {
             name,
             data,
-            system: false,
+            stab: false,
             lines: 0,
             clines: 0,
             includes: vec![],
             included_by: vec![],
             combined_clines: None,
+            contributes_total: None,
         });
     }
 
@@ -90,6 +92,7 @@ enum SortMode {
     Lines,
     CLines,
     IncLines,
+    Contrib,
 }
 
 fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
@@ -108,9 +111,17 @@ fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
             (None, Some(_)) => Ordering::Greater,
             (Some(al), Some(bl)) => al.cmp(&bl).reverse(),
         }),
+        SortMode::Contrib => {
+            data.sort_by(|a, b| match (a.contributes_total, b.contributes_total) {
+                (None, None) => Ordering::Equal,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(al), Some(bl)) => al.cmp(&bl).reverse(),
+            })
+        }
     }
     // Then sort system stuff to the bottom
-    data.sort_by(|a, b| match (a.system, b.system) {
+    data.sort_by(|a, b| match (a.stab, b.stab) {
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
         _ => Ordering::Equal,
@@ -139,12 +150,12 @@ fn process_data_basic(data: &mut Vec<FileInfo>) -> bool {
         })
     }
 
-    // Step 2. Add stabs for system includes
+    // Step 2. Add stabs for missing included
     let mut to_add = HashSet::<String>::new();
     for d in data.iter() {
         for inc in &d.includes {
-            if !inc.system {
-                // should already be on the list
+            if data.iter().any(|x| x.name == inc.name) {
+                // already be on the list
                 continue;
             }
             to_add.insert(inc.name.clone());
@@ -153,12 +164,13 @@ fn process_data_basic(data: &mut Vec<FileInfo>) -> bool {
     data.extend(to_add.into_iter().map(|name| FileInfo {
         name,
         data: "".to_string(),
-        system: true,
+        stab: true,
         includes: vec![],
         included_by: vec![],
         lines: 1,
         clines: 1,
         combined_clines: Some(1),
+        contributes_total: None,
     }));
 
     // Step 3. Index includes for quick access
@@ -169,9 +181,7 @@ fn process_data_basic(data: &mut Vec<FileInfo>) -> bool {
         .collect();
     for d in data.iter_mut() {
         for i in &mut d.includes {
-            if let Some(idx) = hashed.get(&i.name).copied() {
-                i.idx = Some(idx);
-            }
+            i.idx = Some(*hashed.get(&i.name).unwrap());
         }
     }
 
@@ -198,7 +208,19 @@ fn process_data_basic(data: &mut Vec<FileInfo>) -> bool {
 }
 
 fn process_data_tree(data: &mut [FileInfo]) {
-    //for idx in data.enumerate()
+    // Link includers
+    for idx in 0..data.len() {
+        for ii in &data[idx].includes {
+            data[ii.idx.unwrap()].included_by.push(idx);
+        }
+    }
+
+    // Calculate contribution
+    for d in data.iter_mut() {
+        if let Some(clines) = d.combined_clines {
+            d.contributes_total = Some(d.included_by.len() * clines);
+        }
+    }
 }
 
 fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
@@ -215,24 +237,35 @@ fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
 }
 
 fn debug_print(data: &[FileInfo]) {
-    println!("File / Size / Text lines / LoC / # Includes / Combined LoC");
+    println!(
+          "File                                 Size  L.Text  L.Code   In  Out    Contrib   Combined  Some of included files"
+    );
     for it in data {
+        let name = if it.stab {
+            format!("<{}>", it.name)
+        } else {
+            it.name.clone()
+        };
+        let combined_loc = if let Some(n) = it.combined_clines {
+            fmt_bignum(n)
+        } else {
+            "?".to_string()
+        };
+        let contributes_loc = if let Some(n) = it.contributes_total {
+            fmt_bignum(n)
+        } else {
+            "?".to_string()
+        };
         print!(
-            "{: <34}{: >7}  {: >6}  {: >6}  {: >3}  {: >9}",
-            if it.system {
-                format!("<{}>", it.name)
-            } else {
-                it.name.clone()
-            },
+            "{: <34}{: >7}  {: >6}  {: >6}  {: >3}  {: >3} {: >10} {: >10}",
+            name,
             fmt_bignum(it.data.len()),
             fmt_bignum(it.lines),
             fmt_bignum(it.clines),
             it.includes.len(),
-            if let Some(n) = it.combined_clines {
-                fmt_bignum(n)
-            } else {
-                "?".to_string()
-            }
+            it.included_by.len(),
+            contributes_loc,
+            combined_loc
         );
 
         for inc in it.includes.iter().filter(|x| !x.system).take(6) {
@@ -249,8 +282,8 @@ fn debug_print(data: &[FileInfo]) {
     }
     println!(
         "Total files: {} (+{})",
-        data.iter().filter(|x| !x.system).count(),
-        data.iter().filter(|x| x.system).count()
+        data.iter().filter(|x| !x.stab).count(),
+        data.iter().filter(|x| x.stab).count()
     );
     let sum: usize = data.iter().map(|x| x.data.len()).sum();
     println!("Total size: {}", fmt_bignum(sum));
@@ -392,6 +425,7 @@ fn main() {
         "line" => SortMode::Lines,
         "clin" => SortMode::CLines,
         "ilin" => SortMode::IncLines,
+        "cont" => SortMode::Contrib,
         x => {
             println!("Unknown sort method {}", x);
             return;
