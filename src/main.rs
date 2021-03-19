@@ -1,13 +1,14 @@
+use num_format::{Buffer, CustomFormat, Error, Grouping, ToFormattedStr};
 use std::env::args;
 use std::fs::File;
 use std::io::Read;
-use num_format::{Buffer, Error, CustomFormat, Grouping, ToFormattedStr};
 
 struct FileInfo {
     name: String,
     data: String,
     includes: Vec<String>,
-    lines: usize,
+    lines: usize,  // source file lines
+    clines: usize, // code lines
 }
 
 fn load_files(path: &str) -> Vec<FileInfo> {
@@ -33,6 +34,7 @@ fn load_files(path: &str) -> Vec<FileInfo> {
             name,
             data,
             lines: 0,
+            clines: 0,
             includes: vec![],
         });
     }
@@ -45,6 +47,7 @@ enum SortMode {
     Size,
     NumIncludes,
     Lines,
+    CLines,
 }
 
 fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
@@ -56,13 +59,16 @@ fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
         SortMode::Size => data.sort_by(|a, b| a.data.len().cmp(&b.data.len()).reverse()),
         SortMode::NumIncludes => data.sort_by(|a, b| a.includes.len().cmp(&b.includes.len())),
         SortMode::Lines => data.sort_by(|a, b| a.lines.cmp(&b.lines).reverse()),
+        SortMode::CLines => data.sort_by(|a, b| a.clines.cmp(&b.clines).reverse()),
     }
 }
 
 fn process_data(data: &mut [FileInfo]) {
     for d in data {
         d.lines = count_file_lines(&d.data);
-        d.includes = parse_file_includes(&d.data);
+        let (includes, clines) = parse_file_data(&d.data);
+        d.includes = includes;
+        d.clines = clines;
     }
 }
 
@@ -71,7 +77,8 @@ fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
         .grouping(Grouping::Standard)
         .minus_sign("-")
         .separator("'")
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let mut buf = Buffer::new();
     buf.write_formatted(&n, &format);
@@ -79,13 +86,14 @@ fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
 }
 
 fn debug_print(data: &[FileInfo]) {
-    println!("File / Size / Lines / # Includes");
+    println!("File / Size / Lines / Code lines / # Includes");
     for it in data {
         println!(
-            "{: <32}  {: >7} {: >7} {: >3}",
+            "{: <32}  {: >7} {: >6} {: >6} {: >3}",
             it.name,
             fmt_bignum(it.data.len()),
-            it.lines,
+            fmt_bignum(it.lines),
+            fmt_bignum(it.clines),
             it.includes.len()
         );
     }
@@ -98,9 +106,67 @@ fn count_file_lines(data: &str) -> usize {
     data.lines().count()
 }
 
-fn parse_file_includes(data: &str) -> Vec<String> {
+fn skip_whitespace(s: &str) -> Option<&str> {
+    let c = s.chars().nth(0).unwrap();
 
-    vec!["haha.h".to_string(), "hoho.h".to_string()]
+    if c.is_whitespace() || c.is_control() {
+        // skip whitespace & newlines
+        Some(&s[1..])
+    } else {
+        None
+    }
+}
+
+fn skip_comment(s: &str) -> Option<&str> {
+    Some(if s.starts_with("//") {
+        // comment!
+        skip_to_end_of_line(&s[1..])
+    } else if s.starts_with("/*") {
+        // comment!
+        if let Some(idx) = s.find("*/") {
+            &s[idx + 2..]
+        } else {
+            ""
+        }
+    } else {
+        return None;
+    })
+}
+
+fn skip_to_end_of_line(s: &str) -> &str {
+    if let Some(idx) = s.find("\n") {
+        &s[idx + 1..]
+    } else {
+        ""
+    }
+}
+
+fn parse_file_data(data: &str) -> (Vec<String>, usize) {
+    let mut ret = Vec::<String>::new();
+    let mut clines = 0usize;
+
+    let mut s = data;
+    loop {
+        if s.is_empty() {
+            break;
+        }
+
+        if let Some(ss) = skip_whitespace(s) {
+            s = ss;
+            continue;
+        }
+
+        if let Some(ss) = skip_comment(s) {
+            s = ss;
+            continue;
+        }
+
+        let c = s.chars().nth(0).unwrap();
+        clines += 1;
+        s = skip_to_end_of_line(s);
+    }
+
+    (ret, clines)
 }
 
 fn main() {
@@ -114,7 +180,11 @@ fn main() {
         "incl" => SortMode::NumIncludes,
         "size" => SortMode::Size,
         "line" => SortMode::Lines,
-        x => { println!("Unknown sort method {}", x); return; }
+        "clin" => SortMode::CLines,
+        x => {
+            println!("Unknown sort method {}", x);
+            return;
+        }
     };
 
     let mut data = load_files(&args().nth(1).unwrap());
