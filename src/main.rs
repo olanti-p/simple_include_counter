@@ -1,6 +1,7 @@
 use std::env::args;
 use std::fs::File;
 use std::io::Read;
+use num_format::{Buffer, Error, CustomFormat, Grouping, ToFormattedStr};
 
 struct FileInfo {
     name: String,
@@ -37,8 +38,21 @@ fn load_files(path: &str) -> Vec<FileInfo> {
     ret
 }
 
-fn custom_sort(data: &mut [FileInfo]) {
+enum SortMode {
+    Name,
+    Size,
+    NumIncludes,
+}
+
+fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
+    // First sort by name
     data.sort_by(|a, b| a.name.cmp(&b.name));
+    // Then sort by whatever else
+    match mode {
+        SortMode::Name => return,
+        SortMode::Size => data.sort_by(|a, b| a.data.len().cmp(&b.data.len()).reverse()),
+        SortMode::NumIncludes => data.sort_by(|a, b| a.includes.len().cmp(&b.includes.len())),
+    }
 }
 
 fn parse_all_includes(data: &mut [FileInfo]) {
@@ -47,27 +61,53 @@ fn parse_all_includes(data: &mut [FileInfo]) {
     }
 }
 
+fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
+    let format = CustomFormat::builder()
+        .grouping(Grouping::Standard)
+        .minus_sign("-")
+        .separator("'")
+        .build().unwrap();
+
+    let mut buf = Buffer::new();
+    buf.write_formatted(&n, &format);
+    buf.to_string()
+}
+
 fn debug_print(data: &[FileInfo]) {
     println!("File / Size / # Includes");
     for it in data {
-        println!("{: <32}  {: >6} {: >3}", it.name, it.data.len(), it.includes.len());
+        println!(
+            "{: <32}  {: >7} {: >3}",
+            it.name,
+            fmt_bignum(it.data.len()),
+            it.includes.len()
+        );
     }
+    println!("Total files: {}", data.len());
+    let sum: usize = data.iter().map(|x| x.data.len()).sum();
+    println!("Total size: {}", fmt_bignum(sum));
 }
 
 fn parse_file_includes(data: &str) -> Vec<String> {
-
     vec!["haha.h".to_string(), "hoho.h".to_string()]
 }
 
 fn main() {
-    if args().len() != 2 {
-        println!("Expected dir path");
+    if args().len() != 3 {
+        println!("Expected dir path & sort mode");
         return;
     }
 
+    let sort_mode = match args().nth(2).unwrap().as_str() {
+        "name" => SortMode::Name,
+        "incl" => SortMode::NumIncludes,
+        "size" => SortMode::Size,
+        x => { println!("Unknown sort method {}", x); return; }
+    };
+
     let mut data = load_files(&args().nth(1).unwrap());
 
-    custom_sort(&mut data);
+    custom_sort(&mut data, sort_mode);
     parse_all_includes(&mut data);
     debug_print(&data);
 }
