@@ -16,7 +16,8 @@ struct IncludeInfo {
 struct FileInfo {
     name: String,
     data: String,
-    stab: bool,                        // stab for a missing file
+    stab_file: bool,                   // stab for a missing file
+    source_file: bool,                 // is source file (.cpp)
     text_lines: usize,                 // source file lines
     lines: usize,                      // code lines
     parsed_includes: Vec<IncludeInfo>, // includes, as parsed
@@ -33,11 +34,12 @@ struct FileInfo {
 }
 
 impl FileInfo {
-    pub fn new(name: String, data: String, stab: bool) -> Self {
+    pub fn new(name: String, data: String, stab: bool, source_file: bool) -> Self {
         Self {
             name,
             data,
-            stab,
+            stab_file: stab,
+            source_file,
             text_lines: 0,
             lines: 0,
             parsed_includes: vec![],
@@ -54,7 +56,7 @@ impl FileInfo {
 
 impl std::fmt::Display for FileInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.stab {
+        if self.stab_file {
             write!(f, "<{}>", self.name)
         } else {
             write!(f, "{}", self.name)
@@ -81,7 +83,8 @@ fn load_files(path: &str) -> Vec<FileInfo> {
             .read_to_string(&mut data)
             .unwrap();
 
-        ret.push(FileInfo::new(name, data, false));
+        let source_file = name.ends_with(".cpp");
+        ret.push(FileInfo::new(name, data, false, source_file));
     }
 
     ret
@@ -123,15 +126,19 @@ fn custom_sort(data: &[FileInfo], mode: SortMode, dir: bool) -> Vec<usize> {
         }
     };
     if dir {
-        sort_func = Box::new(move|a, b| sort_func(a, b).reverse());
+        sort_func = Box::new(move |a, b| sort_func(a, b).reverse());
     }
     ret.sort_by(|a, b| sort_func(&data[*a], &data[*b]));
 
-    // Then sort external includes to the bottom
-    ret.sort_by(|a, b| match (data[*a].stab, data[*b].stab) {
+    // Then sort external includes & sources to the bottom
+    ret.sort_by(|a, b| match (data[*a].stab_file, data[*b].stab_file) {
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
-        _ => Ordering::Equal,
+        _ => match (data[*a].source_file, data[*b].source_file) {
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ => Ordering::Equal,
+        },
     });
 
     ret
@@ -159,7 +166,7 @@ fn process_step_generate_stubs(data: &mut Vec<FileInfo>, all: &HashSet<String>) 
             // Found
             continue;
         }
-        data.push(FileInfo::new(name.clone(), "".to_string(), true));
+        data.push(FileInfo::new(name.clone(), "".to_string(), true, false));
     }
 }
 
@@ -312,7 +319,7 @@ fn debug_print(data: &[FileInfo], sort_mode: SortMode, sort_dir: bool) {
     for sorted_idx in sorted {
         let it = &data[sorted_idx];
 
-        let name = if it.stab {
+        let name = if it.stab_file {
             format!("<{}>", it.name)
         } else {
             it.name.clone()
@@ -338,7 +345,7 @@ fn debug_print(data: &[FileInfo], sort_mode: SortMode, sort_dir: bool) {
             a.cmp(&b).reverse()
         });
         for inc in incl_by {
-            if data[inc].stab {
+            if data[inc].stab_file {
                 print!("  <{}>", data[inc].name);
             } else {
                 print!("  {}", data[inc].name);
@@ -346,15 +353,30 @@ fn debug_print(data: &[FileInfo], sort_mode: SortMode, sort_dir: bool) {
         }
         println!();
     }
+
     println!(
-        "Total files: {} (+{})",
-        data.iter().filter(|x| !x.stab).count(),
-        data.iter().filter(|x| x.stab).count()
+        "Total files: {} sources, {} includes, {} other includes",
+        data.iter().filter(|x| x.source_file).count(),
+        data.iter()
+            .filter(|x| !x.source_file && !x.stab_file)
+            .count(),
+        data.iter().filter(|x| x.stab_file).count()
     );
-    let sum: usize = data.iter().map(|x| x.data.len()).sum();
-    println!("Total size: {}", fmt_bignum(sum));
-    let sum: usize = data.iter().map(|x| x.lines_contributes_total).sum();
-    println!("Total size with includes: {}", fmt_bignum(sum));
+
+    let sum: usize = data.iter().map(|x| x.lines).sum();
+    println!("Total code lines: {}", fmt_bignum(sum));
+
+    let sum: usize = data
+        .iter()
+        .map(|x| {
+            if x.source_file {
+                x.lines_with_all_includes
+            } else {
+                0
+            }
+        })
+        .sum();
+    println!("Total compiled code lines: {}", fmt_bignum(sum));
 }
 
 fn count_file_lines(data: &str) -> usize {
