@@ -4,6 +4,7 @@ use num_format::{Buffer, CustomFormat, Grouping, ToFormattedStr};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::env::args;
+use std::fmt::Write;
 use std::fs::File;
 use std::io::Read;
 
@@ -86,60 +87,6 @@ fn load_files(path: &str) -> Vec<FileInfo> {
         let source_file = name.ends_with(".cpp");
         ret.push(FileInfo::new(name, data, false, source_file));
     }
-
-    ret
-}
-
-enum SortMode {
-    FileName,
-    FileSize,
-    NumIncludes,
-    TextLines,
-    Lines,
-    LinesWithAllIncludes,
-    ContribWithAllIncludes,
-    ContribSelfOnly,
-}
-
-fn custom_sort(data: &[FileInfo], mode: SortMode, dir: bool) -> Vec<usize> {
-    let mut ret: Vec<usize> = (0..data.len()).collect();
-
-    // First sort by name
-    ret.sort_by(|a, b| data[*a].name.cmp(&data[*b].name));
-
-    // Then sort by whatever else
-
-    let mut sort_func: Box<dyn Fn(&FileInfo, &FileInfo) -> Ordering> = match mode {
-        SortMode::FileName => Box::new(|_, _| Ordering::Equal),
-        SortMode::FileSize => Box::new(|a, b| a.data.len().cmp(&b.data.len())),
-        SortMode::NumIncludes => Box::new(|a, b| a.includes.len().cmp(&b.includes.len())),
-        SortMode::Lines => Box::new(|a, b| a.lines.cmp(&b.lines)),
-        SortMode::TextLines => Box::new(|a, b| a.text_lines.cmp(&b.text_lines)),
-        SortMode::LinesWithAllIncludes => {
-            Box::new(|a, b| a.lines_with_all_includes.cmp(&b.lines_with_all_includes))
-        }
-        SortMode::ContribWithAllIncludes => {
-            Box::new(|a, b| a.lines_contributes_total.cmp(&b.lines_contributes_total))
-        }
-        SortMode::ContribSelfOnly => {
-            Box::new(|a, b| a.lines_contributes_self.cmp(&b.lines_contributes_self))
-        }
-    };
-    if dir {
-        sort_func = Box::new(move |a, b| sort_func(a, b).reverse());
-    }
-    ret.sort_by(|a, b| sort_func(&data[*a], &data[*b]));
-
-    // Then sort external includes & sources to the bottom
-    ret.sort_by(|a, b| match (data[*a].stab_file, data[*b].stab_file) {
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        _ => match (data[*a].source_file, data[*b].source_file) {
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            _ => Ordering::Equal,
-        },
-    });
 
     ret
 }
@@ -300,7 +247,7 @@ fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
     let format = CustomFormat::builder()
         .grouping(Grouping::Standard)
         .minus_sign("-")
-        .separator("'")
+        .separator("")
         .build()
         .unwrap();
 
@@ -309,50 +256,106 @@ fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
     buf.to_string()
 }
 
-fn debug_print(data: &[FileInfo], sort_mode: SortMode, sort_dir: bool) {
-    let sorted = custom_sort(data, sort_mode, sort_dir);
-
-    println!(
-          "File                                 Size  L.Text  L.Code   In / All  Out / All      Combined  ContribSelf    Heaviest headers that include this one"
-    );
-
-    for sorted_idx in sorted {
-        let it = &data[sorted_idx];
-
-        let name = if it.stab_file {
-            format!("<{}>", it.name)
+fn fmt_includers(data: &[FileInfo], it: &FileInfo) -> String {
+    let mut incl_by = it.included_by.clone();
+    incl_by.retain(|x| !data[*x].source_file);
+    incl_by.sort_by(|a, b| {
+        let an = data[*a].included_by_indirect.len();
+        let bn = data[*b].included_by_indirect.len();
+        let ret = an.cmp(&bn).reverse();
+        if ret == Ordering::Equal {
+            data[*a].name.cmp(&data[*b].name)
         } else {
-            it.name.clone()
-        };
-        print!(
-            "{: <34}{: >7}  {: >6}  {: >6}  {: >3} / {: >3}  {: >3} / {: >3}  {: >11} {: >11}",
-            name,
-            fmt_bignum(it.data.len()),
-            fmt_bignum(it.text_lines),
-            fmt_bignum(it.lines),
-            fmt_bignum(it.includes.len()),
-            fmt_bignum(it.includes_indirect.len()),
-            fmt_bignum(it.included_by.len()),
-            fmt_bignum(it.included_by_indirect.len()),
-            fmt_bignum(it.lines_with_all_includes),
-            fmt_bignum(it.lines_contributes_self),
-        );
-
-        let mut incl_by = it.included_by.clone();
-        incl_by.sort_by(|a, b| {
-            let a = data[*a].lines_contributes_self;
-            let b = data[*b].lines_contributes_self;
-            a.cmp(&b).reverse()
-        });
-        for inc in incl_by {
-            if data[inc].stab_file {
-                print!("  <{}>", data[inc].name);
-            } else {
-                print!("  {}", data[inc].name);
-            }
+            ret
         }
-        println!();
+    });
+
+    let mut ret = String::new();
+
+    for inc_idx in &incl_by {
+        let inc = &data[*inc_idx];
+        if inc.stab_file {
+            write!(ret, "<{}> ", inc.name).unwrap();
+        } else {
+            write!(ret, "{} ", inc.name).unwrap();
+        }
     }
+
+    let hidden = it.included_by.len() - incl_by.len();
+    if hidden > 0 {
+        write!(ret, "h_{}", hidden).unwrap();
+    }
+
+    ret
+}
+
+fn print_one(data: &[FileInfo], it: &FileInfo) {
+    let name = if it.stab_file {
+        format!("<{}>", it.name)
+    } else {
+        it.name.clone()
+    };
+    println!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        name,
+        fmt_bignum(it.data.len()),
+        fmt_bignum(it.text_lines),
+        fmt_bignum(it.lines),
+        fmt_bignum(it.includes.len()),
+        fmt_bignum(it.includes_indirect.len()),
+        fmt_bignum(it.included_by.len()),
+        fmt_bignum(it.included_by_indirect.len()),
+        fmt_bignum(it.lines_with_all_includes),
+        fmt_bignum(it.lines_contributes_self),
+        fmt_includers(data, it),
+    );
+}
+
+fn debug_print(data: &[FileInfo]) {
+    let headers = &[
+        "File",
+        "File size",
+        "Text lines",
+        "Code lines",
+        "Includes (direct)",
+        "Includes (total)",
+        "Included by (direct)",
+        "Included by (total)",
+        "Code lines with all includes",
+        "Contributes (self)",
+        "Most commonly included direct includers",
+    ];
+
+    println!("{}", headers.join("\t"));
+
+    // Project headers
+    for it in data.iter() {
+        if it.source_file || it.stab_file {
+            continue;
+        }
+        print_one(data, it);
+    }
+    println!();
+
+    // Other headers
+    for it in data.iter() {
+        if it.source_file || !it.stab_file {
+            continue;
+        }
+        print_one(data, it);
+    }
+    println!();
+
+    // Source files
+    for it in data.iter() {
+        if !it.source_file {
+            continue;
+        }
+        print_one(data, it);
+    }
+    println!();
+
+    println!();
 
     println!(
         "Total files: {} sources, {} includes, {} other includes",
@@ -500,34 +503,10 @@ fn parse_file_data(data: &str) -> (Vec<IncludeInfo>, usize) {
 }
 
 fn main() {
-    if args().len() != 4 {
-        eprintln!("Expected 3 args: dir path, sort mode, sort dir");
+    if args().len() != 2 {
+        eprintln!("Expected 1 args: dir path");
         return;
     }
-
-    let sort_mode = match args().nth(2).unwrap().as_str() {
-        "fname" => SortMode::FileName,
-        "fsize" => SortMode::FileSize,
-        "num_includes" => SortMode::NumIncludes,
-        "code_lines" => SortMode::Lines,
-        "text_lines" => SortMode::TextLines,
-        "code_lines_total" => SortMode::LinesWithAllIncludes,
-        "cont_self" => SortMode::ContribSelfOnly,
-        "cont_total" => SortMode::ContribWithAllIncludes,
-        x => {
-            eprintln!("Unknown sort method '{}'", x);
-            return;
-        }
-    };
-
-    let sort_dir = match args().nth(3).unwrap().as_str() {
-        "norm" => false,
-        "rev" => true,
-        x => {
-            eprintln!("Unknown sort dir '{}'", x);
-            return;
-        }
-    };
 
     let mut data = load_files(&args().nth(1).unwrap());
     if !process_data(&mut data) {
@@ -535,6 +514,6 @@ fn main() {
         return;
     }
     eprintln!("Writing...");
-    debug_print(&data, sort_mode, sort_dir);
+    debug_print(&data);
     eprintln!("Done.");
 }
