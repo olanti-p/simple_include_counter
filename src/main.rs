@@ -28,10 +28,11 @@ struct FileInfo {
 
     includes_indirect: Vec<usize>,
     included_by_indirect: Vec<usize>,
+    included_by_indirect_cpp: Vec<usize>,
 
     lines_with_all_includes: usize, // code lines with all direct & indirect includes counted once
-    lines_contributes_total: usize, // code lines contribution (with all direct & indirect includes) to all direct & indirect includers
-    lines_contributes_self: usize, // code lines contribution (this file only) to all direct & indirect includers
+    compile_contrib_total: usize, // code lines contribution (with all direct & indirect includes) to all direct & indirect .cpp includers
+    compile_contrib_self: usize, // code lines contribution (this file only) to all direct & indirect .cpp includers
 }
 
 impl FileInfo {
@@ -49,8 +50,9 @@ impl FileInfo {
             includes_indirect: vec![],
             included_by_indirect: vec![],
             lines_with_all_includes: 0,
-            lines_contributes_total: 0,
-            lines_contributes_self: 0,
+            compile_contrib_total: 0,
+            compile_contrib_self: 0,
+            included_by_indirect_cpp: vec![],
         }
     }
 }
@@ -205,6 +207,10 @@ fn process_step_link_include_indirect(data: &mut [FileInfo]) {
         let mut temp = HashSet::<usize>::new();
         recurse_collect_included_by(data, idx, &mut temp);
         data[idx].included_by_indirect = temp.into_iter().collect();
+
+        let mut cpplist = data[idx].included_by_indirect.clone();
+        cpplist.retain(|x| data[*x].source_file);
+        data[idx].included_by_indirect_cpp = cpplist;
     }
 }
 
@@ -216,10 +222,16 @@ fn process_step_calc_costs(data: &mut [FileInfo]) {
             .iter()
             .map(|x| data[*x].lines)
             .sum();
-        data[idx].lines_with_all_includes = data[idx].lines + sum;
-        data[idx].lines_contributes_self = data[idx].lines * data[idx].included_by_indirect.len();
-        data[idx].lines_contributes_total =
-            data[idx].lines_with_all_includes * data[idx].included_by_indirect.len();
+
+        let it = &mut data[idx];
+        it.lines_with_all_includes = it.lines + sum;
+        if it.source_file {
+            it.compile_contrib_self = it.lines;
+            it.compile_contrib_total = it.lines_with_all_includes;
+        } else {
+            it.compile_contrib_self = it.lines * it.included_by_indirect_cpp.len();
+            it.compile_contrib_total = it.lines_with_all_includes * it.included_by_indirect_cpp.len();
+        }
     }
 }
 
@@ -296,7 +308,7 @@ fn print_one(data: &[FileInfo], it: &FileInfo) {
         it.name.clone()
     };
     println!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         name,
         fmt_bignum(it.data.len()),
         fmt_bignum(it.text_lines),
@@ -304,9 +316,10 @@ fn print_one(data: &[FileInfo], it: &FileInfo) {
         fmt_bignum(it.includes.len()),
         fmt_bignum(it.includes_indirect.len()),
         fmt_bignum(it.included_by.len()),
-        fmt_bignum(it.included_by_indirect.len()),
+        fmt_bignum(it.included_by_indirect_cpp.len()),
         fmt_bignum(it.lines_with_all_includes),
-        fmt_bignum(it.lines_contributes_self),
+        fmt_bignum(it.compile_contrib_self),
+        fmt_bignum(it.compile_contrib_total),
         fmt_includers(data, it),
     );
 }
@@ -320,9 +333,10 @@ fn debug_print(data: &[FileInfo]) {
         "Includes (direct)",
         "Includes (total)",
         "Included by (direct)",
-        "Included by (total)",
+        "Included by cpp (total)",
         "Code lines with all includes",
-        "Contributes (self)",
+        "Contributes to cmp (self)",
+        "Contributes to cmp (total)",
         "Most commonly included direct includers",
     ];
 
