@@ -2,51 +2,63 @@
 
 use num_format::{Buffer, CustomFormat, Grouping, ToFormattedStr};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env::args;
 use std::fs::File;
 use std::io::Read;
 
 struct IncludeInfo {
     name: String,
+    /// true if was included as <header>, false if as "header"
     system: bool,
-    idx: Option<usize>,
 }
 
 struct FileInfo {
     name: String,
     data: String,
-    stab: bool, // stab for a missing file
+    stab: bool,                        // stab for a missing file
+    text_lines: usize,                 // source file lines
+    lines: usize,                      // code lines
+    parsed_includes: Vec<IncludeInfo>, // includes, as parsed
 
-    includes: Vec<IncludeInfo>,
+    includes: Vec<usize>,
     included_by: Vec<usize>,
 
-    lines: usize,  // source file lines
-    clines: usize, // code lines
+    includes_indirect: Vec<usize>,
+    included_by_indirect: Vec<usize>,
 
-    combined_clines: Option<usize>,   // code lines with includes
-    contributes_total: Option<usize>, // contributes lines in total
+    lines_with_all_includes: usize, // code lines with all direct & indirect includes counted once
+    lines_contributes_total: usize, // code lines contribution (with all direct & indirect includes) to all direct & indirect includers
+    lines_contributes_self: usize, // code lines contribution (this file only) to all direct & indirect includers
 }
 
-impl std::fmt::Display for IncludeInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.system {
-            write!(f, "<{}>", self.name)
-        } else {
-            write!(f, "{}", self.name)
+impl FileInfo {
+    pub fn new(name: String, data: String, stab: bool) -> Self {
+        Self {
+            name,
+            data,
+            stab,
+            text_lines: 0,
+            lines: 0,
+            parsed_includes: vec![],
+            includes: vec![],
+            included_by: vec![],
+            includes_indirect: vec![],
+            included_by_indirect: vec![],
+            lines_with_all_includes: 0,
+            lines_contributes_total: 0,
+            lines_contributes_self: 0,
         }
     }
 }
 
-impl FileInfo {
-    pub fn combined_clines(&self, data: &[FileInfo]) -> Option<usize> {
-        let mut ret = self.lines;
-        for inc in &self.includes {
-            if let Some(idx) = inc.idx {
-                ret += data[idx].combined_clines?;
-            }
+impl std::fmt::Display for FileInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.stab {
+            write!(f, "<{}>", self.name)
+        } else {
+            write!(f, "{}", self.name)
         }
-        Some(ret)
     }
 }
 
@@ -69,158 +81,212 @@ fn load_files(path: &str) -> Vec<FileInfo> {
             .read_to_string(&mut data)
             .unwrap();
 
-        ret.push(FileInfo {
-            name,
-            data,
-            stab: false,
-            lines: 0,
-            clines: 0,
-            includes: vec![],
-            included_by: vec![],
-            combined_clines: None,
-            contributes_total: None,
-        });
+        ret.push(FileInfo::new(name, data, false));
     }
 
     ret
 }
 
 enum SortMode {
-    Name,
-    Size,
+    FileName,
+    FileSize,
     NumIncludes,
+    TextLines,
     Lines,
-    CLines,
-    IncLines,
-    Contrib,
+    LinesWithAllIncludes,
+    ContribWithAllIncludes,
+    ContribSelfOnly,
 }
 
-fn custom_sort(data: &mut [FileInfo], mode: SortMode) {
+fn custom_sort(data: &[FileInfo], mode: SortMode, dir: bool) -> Vec<usize> {
+    let mut ret: Vec<usize> = (0..data.len()).collect();
+
     // First sort by name
-    data.sort_by(|a, b| a.name.cmp(&b.name));
+    ret.sort_by(|a, b| data[*a].name.cmp(&data[*b].name));
+
     // Then sort by whatever else
-    match mode {
-        SortMode::Name => {}
-        SortMode::Size => data.sort_by(|a, b| a.data.len().cmp(&b.data.len()).reverse()),
-        SortMode::NumIncludes => data.sort_by(|a, b| a.includes.len().cmp(&b.includes.len())),
-        SortMode::Lines => data.sort_by(|a, b| a.lines.cmp(&b.lines).reverse()),
-        SortMode::CLines => data.sort_by(|a, b| a.clines.cmp(&b.clines).reverse()),
-        SortMode::IncLines => data.sort_by(|a, b| match (a.combined_clines, b.combined_clines) {
-            (None, None) => Ordering::Equal,
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(al), Some(bl)) => al.cmp(&bl).reverse(),
-        }),
-        SortMode::Contrib => {
-            data.sort_by(|a, b| match (a.contributes_total, b.contributes_total) {
-                (None, None) => Ordering::Equal,
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(al), Some(bl)) => al.cmp(&bl).reverse(),
-            })
+
+    let mut sort_func: Box<dyn Fn(&FileInfo, &FileInfo) -> Ordering> = match mode {
+        SortMode::FileName => Box::new(|_, _| Ordering::Equal),
+        SortMode::FileSize => Box::new(|a, b| a.data.len().cmp(&b.data.len())),
+        SortMode::NumIncludes => Box::new(|a, b| a.includes.len().cmp(&b.includes.len())),
+        SortMode::Lines => Box::new(|a, b| a.lines.cmp(&b.lines)),
+        SortMode::TextLines => Box::new(|a, b| a.text_lines.cmp(&b.text_lines)),
+        SortMode::LinesWithAllIncludes => {
+            Box::new(|a, b| a.lines_with_all_includes.cmp(&b.lines_with_all_includes))
         }
+        SortMode::ContribWithAllIncludes => {
+            Box::new(|a, b| a.lines_contributes_total.cmp(&b.lines_contributes_total))
+        }
+        SortMode::ContribSelfOnly => {
+            Box::new(|a, b| a.lines_contributes_self.cmp(&b.lines_contributes_self))
+        }
+    };
+    if dir {
+        sort_func = Box::new(move|a, b| sort_func(a, b).reverse());
     }
-    // Then sort system stuff to the bottom
-    data.sort_by(|a, b| match (a.stab, b.stab) {
+    ret.sort_by(|a, b| sort_func(&data[*a], &data[*b]));
+
+    // Then sort external includes to the bottom
+    ret.sort_by(|a, b| match (data[*a].stab, data[*b].stab) {
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
         _ => Ordering::Equal,
     });
+
+    ret
 }
 
-/// Returns whether it's possible to build a tree without circular dependencies
-fn process_data_basic(data: &mut Vec<FileInfo>) -> bool {
-    // Step 1. Parse files
+/// Returns all mentioned files by their names
+fn process_step_parse(data: &mut [FileInfo]) -> HashSet<String> {
+    let mut ret = HashSet::<String>::new();
     for d in data.iter_mut() {
-        d.lines = count_file_lines(&d.data);
+        d.text_lines = count_file_lines(&d.data);
         let (includes, clines) = parse_file_data(&d.data);
-        d.includes = includes;
-        d.clines = clines;
-
-        d.includes.sort_by(|a, b| {
-            if a.system != b.system {
-                if a.system {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            } else {
-                a.name.cmp(&b.name)
-            }
-        })
-    }
-
-    // Step 2. Add stabs for missing included
-    let mut to_add = HashSet::<String>::new();
-    for d in data.iter() {
-        for inc in &d.includes {
-            if data.iter().any(|x| x.name == inc.name) {
-                // already be on the list
-                continue;
-            }
-            to_add.insert(inc.name.clone());
+        d.parsed_includes = includes;
+        d.lines = clines;
+        for ii in &d.parsed_includes {
+            ret.insert(ii.name.to_string());
         }
     }
-    data.extend(to_add.into_iter().map(|name| FileInfo {
-        name,
-        data: "".to_string(),
-        stab: true,
-        includes: vec![],
-        included_by: vec![],
-        lines: 1,
-        clines: 1,
-        combined_clines: Some(1),
-        contributes_total: None,
-    }));
+    ret
+}
 
-    // Step 3. Index includes for quick access
-    let hashed: HashMap<String, usize> = data
+/// Generate stubs for missing include files
+fn process_step_generate_stubs(data: &mut Vec<FileInfo>, all: &HashSet<String>) {
+    for name in all {
+        if data.iter().any(|x| &x.name == name) {
+            // Found
+            continue;
+        }
+        data.push(FileInfo::new(name.clone(), "".to_string(), true));
+    }
+}
+
+/// Link includers and includees
+fn process_step_link_include(data: &mut [FileInfo]) {
+    for idx in 0..data.len() {
+        for idx2 in 0..data[idx].parsed_includes.len() {
+            let that_name = &data[idx].parsed_includes[idx2].name;
+            let idx_that = data
+                .iter()
+                .enumerate()
+                .find_map(|(idx, x)| {
+                    if &x.name == that_name {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+
+            data[idx_that].included_by.push(idx);
+            data[idx].includes.push(idx_that);
+        }
+    }
+}
+
+struct CircCheck {
+    idx: usize,
+    included_by: Vec<usize>,
+}
+
+/// Check circular dependencies
+fn process_step_check_circular(data: &[FileInfo]) -> Option<(usize, usize)> {
+    let mut all: Vec<CircCheck> = data
         .iter()
         .enumerate()
-        .map(|(idx, x)| (x.name.clone(), idx))
+        .map(|(idx, x)| CircCheck {
+            idx,
+            included_by: x.included_by.clone(),
+        })
         .collect();
-    for d in data.iter_mut() {
-        for i in &mut d.includes {
-            i.idx = Some(*hashed.get(&i.name).unwrap());
-        }
-    }
 
-    // Step 4. Calculate combined cost
     loop {
         let mut did_something = false;
-        for idx in 0..data.len() {
-            let info: &FileInfo = &data[idx];
-            if info.combined_clines.is_some() {
-                // Already checked
-                continue;
+        for i in 0..all.len() {
+            let idx_this = all[i].idx;
+            if all[i].included_by.is_empty() {
+                all.remove(i);
+                for elem in &mut all {
+                    elem.included_by.retain(|x| *x != idx_this);
+                }
+                did_something = true;
+                break;
             }
-            let combined_clines = info.combined_clines(data);
-            did_something = did_something || combined_clines.is_some();
-            data[idx].combined_clines = combined_clines;
         }
         if !did_something {
-            // Cannot resolve further
             break;
         }
     }
 
-    data.iter().all(|x| x.combined_clines.is_some())
+    if all.is_empty() {
+        None
+    } else {
+        Some((all[0].idx, all[0].included_by[0]))
+    }
 }
 
-fn process_data_tree(data: &mut [FileInfo]) {
-    // Link includers
-    for idx in 0..data.len() {
-        for ii in &data[idx].includes {
-            data[ii.idx.unwrap()].included_by.push(idx);
-        }
+fn recurse_collect_includes(data: &[FileInfo], idx: usize, ret: &mut HashSet<usize>) {
+    for idx2 in &data[idx].includes {
+        ret.insert(*idx2);
+        recurse_collect_includes(data, *idx2, ret);
     }
+}
 
-    // Calculate contribution
-    for d in data.iter_mut() {
-        if let Some(clines) = d.combined_clines {
-            d.contributes_total = Some(d.included_by.len() * clines);
-        }
+fn recurse_collect_included_by(data: &[FileInfo], idx: usize, ret: &mut HashSet<usize>) {
+    for idx2 in &data[idx].included_by {
+        ret.insert(*idx2);
+        recurse_collect_included_by(data, *idx2, ret);
     }
+}
+
+/// Link indirect inclusions
+fn process_step_link_include_indirect(data: &mut [FileInfo]) {
+    for idx in 0..data.len() {
+        let mut temp = HashSet::<usize>::new();
+        recurse_collect_includes(data, idx, &mut temp);
+        data[idx].includes_indirect = temp.into_iter().collect();
+
+        let mut temp = HashSet::<usize>::new();
+        recurse_collect_included_by(data, idx, &mut temp);
+        data[idx].included_by_indirect = temp.into_iter().collect();
+    }
+}
+
+/// Calculate cost of this file with all includes
+fn process_step_calc_costs(data: &mut [FileInfo]) {
+    for idx in 0..data.len() {
+        let sum: usize = data[idx]
+            .includes_indirect
+            .iter()
+            .map(|x| data[*x].lines)
+            .sum();
+        data[idx].lines_with_all_includes = data[idx].lines + sum;
+        data[idx].lines_contributes_self = data[idx].lines * data[idx].included_by_indirect.len();
+        data[idx].lines_contributes_total =
+            data[idx].lines_with_all_includes * data[idx].included_by_indirect.len();
+    }
+}
+
+/// Returns whether it's possible to build a tree without circular dependencies
+fn process_data(data: &mut Vec<FileInfo>) -> bool {
+    eprintln!("Parsing files...");
+    let to_add = process_step_parse(data);
+    eprintln!("Generating stubs for missing includes...");
+    process_step_generate_stubs(data, &to_add);
+    eprintln!("Resolving include relations...");
+    process_step_link_include(data);
+    eprintln!("Checking circular dependencies...");
+    if let Some((a, b)) = process_step_check_circular(data) {
+        eprintln!("Circular dependency detected: {} <-> {}", data[a], data[b]);
+        return false;
+    }
+    eprintln!("Resolving indirect includes...");
+    process_step_link_include_indirect(data);
+    eprintln!("Calculating include costs...");
+    process_step_calc_costs(data);
+    true
 }
 
 fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
@@ -236,42 +302,39 @@ fn fmt_bignum<T: ToFormattedStr>(n: T) -> String {
     buf.to_string()
 }
 
-fn debug_print(data: &[FileInfo]) {
+fn debug_print(data: &[FileInfo], sort_mode: SortMode, sort_dir: bool) {
+    let sorted = custom_sort(data, sort_mode, sort_dir);
+
     println!(
-          "File                                 Size  L.Text  L.Code   In  Out     Contrib    Combined  Heaviest headers that include this one"
+          "File                                 Size  L.Text  L.Code   In / All  Out / All      Combined  ContribSelf    Heaviest headers that include this one"
     );
-    for it in data {
+
+    for sorted_idx in sorted {
+        let it = &data[sorted_idx];
+
         let name = if it.stab {
             format!("<{}>", it.name)
         } else {
             it.name.clone()
         };
-        let combined_loc = if let Some(n) = it.combined_clines {
-            fmt_bignum(n)
-        } else {
-            "?".to_string()
-        };
-        let contributes_loc = if let Some(n) = it.contributes_total {
-            fmt_bignum(n)
-        } else {
-            "?".to_string()
-        };
         print!(
-            "{: <34}{: >7}  {: >6}  {: >6}  {: >3}  {: >3} {: >11} {: >11}",
+            "{: <34}{: >7}  {: >6}  {: >6}  {: >3} / {: >3}  {: >3} / {: >3}  {: >11} {: >11}",
             name,
             fmt_bignum(it.data.len()),
+            fmt_bignum(it.text_lines),
             fmt_bignum(it.lines),
-            fmt_bignum(it.clines),
-            it.includes.len(),
-            it.included_by.len(),
-            contributes_loc,
-            combined_loc
+            fmt_bignum(it.includes.len()),
+            fmt_bignum(it.includes_indirect.len()),
+            fmt_bignum(it.included_by.len()),
+            fmt_bignum(it.included_by_indirect.len()),
+            fmt_bignum(it.lines_with_all_includes),
+            fmt_bignum(it.lines_contributes_self),
         );
 
         let mut incl_by = it.included_by.clone();
         incl_by.sort_by(|a, b| {
-            let a = data[*a].contributes_total.unwrap_or(0);
-            let b = data[*b].contributes_total.unwrap_or(0);
+            let a = data[*a].lines_contributes_self;
+            let b = data[*b].lines_contributes_self;
             a.cmp(&b).reverse()
         });
         for inc in incl_by {
@@ -290,7 +353,7 @@ fn debug_print(data: &[FileInfo]) {
     );
     let sum: usize = data.iter().map(|x| x.data.len()).sum();
     println!("Total size: {}", fmt_bignum(sum));
-    let sum: usize = data.iter().map(|x| x.combined_clines.unwrap_or(0)).sum();
+    let sum: usize = data.iter().map(|x| x.lines_contributes_total).sum();
     println!("Total size with includes: {}", fmt_bignum(sum));
 }
 
@@ -377,7 +440,6 @@ fn try_extract_include(s: &str) -> Option<IncludeInfo> {
         Some(IncludeInfo {
             name: name.to_string(),
             system,
-            idx: None,
         })
     } else {
         None
@@ -416,31 +478,41 @@ fn parse_file_data(data: &str) -> (Vec<IncludeInfo>, usize) {
 }
 
 fn main() {
-    if args().len() != 3 {
-        println!("Expected dir path & sort mode");
+    if args().len() != 4 {
+        eprintln!("Expected 3 args: dir path, sort mode, sort dir");
         return;
     }
 
     let sort_mode = match args().nth(2).unwrap().as_str() {
-        "name" => SortMode::Name,
-        "incl" => SortMode::NumIncludes,
-        "size" => SortMode::Size,
-        "line" => SortMode::Lines,
-        "clin" => SortMode::CLines,
-        "ilin" => SortMode::IncLines,
-        "cont" => SortMode::Contrib,
+        "fname" => SortMode::FileName,
+        "fsize" => SortMode::FileSize,
+        "num_includes" => SortMode::NumIncludes,
+        "code_lines" => SortMode::Lines,
+        "text_lines" => SortMode::TextLines,
+        "code_lines_total" => SortMode::LinesWithAllIncludes,
+        "cont_self" => SortMode::ContribSelfOnly,
+        "cont_total" => SortMode::ContribWithAllIncludes,
         x => {
-            println!("Unknown sort method {}", x);
+            eprintln!("Unknown sort method '{}'", x);
+            return;
+        }
+    };
+
+    let sort_dir = match args().nth(3).unwrap().as_str() {
+        "norm" => false,
+        "rev" => true,
+        x => {
+            eprintln!("Unknown sort dir '{}'", x);
             return;
         }
     };
 
     let mut data = load_files(&args().nth(1).unwrap());
-    let can_build_tree = process_data_basic(&mut data);
-    if can_build_tree {
-        process_data_tree(&mut data);
+    if !process_data(&mut data) {
+        eprintln!("Failed.");
+        return;
     }
-    custom_sort(&mut data, sort_mode);
-    debug_print(&data);
-    println!("Done.");
+    eprintln!("Writing...");
+    debug_print(&data, sort_mode, sort_dir);
+    eprintln!("Done.");
 }
