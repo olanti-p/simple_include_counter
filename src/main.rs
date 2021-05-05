@@ -517,12 +517,17 @@ fn parse_file_data(data: &str) -> (Vec<IncludeInfo>, usize) {
 }
 
 fn main() {
-    if args().len() != 2 {
-        eprintln!("Expected 1 args: dir path");
+    if args().len() < 2 {
+        eprintln!("Expected at least 1 dir path");
         return;
     }
 
-    let mut data = load_files(&args().nth(1).unwrap());
+    let mut data = Vec::<FileInfo>::new();
+    for dir in args().skip(1) {
+        let temp = load_files(&dir);
+        data.extend(temp.into_iter());
+    }
+
     if !process_data(&mut data) {
         eprintln!("Failed.");
         return;
